@@ -1,0 +1,166 @@
+name: daily-radar
+# 매일 06:00 KST 수집 → 집계 → data 브랜치에 DB 저장 → GitHub Pages 배포
+on:
+  schedule:
+    - cron: "17 21 * * *"       # UTC 21:17 = KST 06:17 (정각은 GitHub 혼잡으로 지연·누락이 잦아 17분으로)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto=실제 수집 / fixture=가짜 데이터 / export=수집 없이 화면+AI 재생성 / web=화면만 빠르게(AI 없음, 디자인 배포용)"
+        type: choice
+        options: [auto, fixture, export, web]
+        default: auto
+      search_q:
+        description: "(선택) search.list 키워드 1회 — 100유닛 소모, 하루 20회 상한"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  issues: write
+
+concurrency:
+  group: daily-radar
+  cancel-in-progress: false
+
+env:
+  MY_PROJECTS_YAML: ${{ secrets.MY_PROJECTS_YAML }}   # 입찰 실적표 (공개 저장소라 Secret)
+  TZ: Asia/Seoul
+  RADAR_DATA_DIR: data
+  RADAR_DB: data/radar.db
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # 11/6 예약 실행이 AI 채점 60건+패키지로 30분 초과 → 취소됨
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -q google-auth requests "anthropic[vertex]>=1.7,<2"
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: web/package-lock.json }
+
+      - name: 이전 DB 복원 (data 브랜치)
+        run: |
+          mkdir -p data
+          if git fetch --depth=1 origin data 2>/dev/null; then
+            git show origin/data:radar.db.gz | gunzip > data/radar.db || true
+            for f in $(git ls-tree --name-only origin/data | grep '\.json$'); do git show origin/data:$f > data/$f 2>/dev/null || rm -f data/$f; done
+          fi
+          ls -la data
+
+      - name: 수집 + 집계
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+          MODE: ${{ inputs.mode || 'auto' }}
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SEARCH_Q: ${{ inputs.search_q }}
+        run: |
+          case "$MODE" in
+            fixture) RADAR_DB=data/fixture.db python -m radar demo --days 30 ;;
+            web)     python -m radar export --date "$(date +%F)" && python -m radar bids && (cp data/gtrends.json web/public/data/ 2>/dev/null || true) ;;   # 디자인 배포: AI 생략, 약 1분
+            export)  python -m radar export --date "$(date +%F)" && python -m radar enrich ;;   # enrich: API 쿼터 0, Gemini만 사용
+            *)       python -m radar daily && python -m radar enrich ;;   # enrich: Gemini·Brave 키가 있을 때만 동작
+          esac
+          if [ "$MODE" = "web" ]; then exit 0; fi
+          python -m radar bids || true         # 🏛 입찰레이더 (DATA_GO_KR_KEY 없으면 예시 데이터)
+          python -m radar gtrends || true      # 구글 트렌드 RSS (+ Gemini 키 있으면 AI 기획안)
+          if [ "$MODE" != "fixture" ]; then python -m radar localize || true; fi   # 🌍 해외 인기 → 한국화 기획 (키 있을 때)
+          if [ -n "$SEARCH_Q" ] && [ "$MODE" != "export" ]; then python -m radar search --q "$SEARCH_Q"; fi
+          python -m radar quota-plan
+
+      - name: DB 저장 (data 브랜치, 히스토리 없이 최신 1개만 유지)
+        if: inputs.mode != 'fixture'
+        run: |
+          set -e
+          tmp=$(mktemp -d)
+          gzip -c data/radar.db > "$tmp/radar.db.gz"
+          cp data/*.json "$tmp/" 2>/dev/null || true
+          cd "$tmp"
+          git init -q -b data
+          git config user.name "ccs-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '# data 브랜치\n자동 생성. radar.db.gz = SQLite 스냅샷(gzip). 직접 수정 금지.\n' > README.md
+          git add -A
+          git commit -qm "data: $(date +%F)"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data:data
+          ls -la
+
+      - name: 알림 Issue (레퍼런스 채널 새 💥)
+        if: inputs.mode != 'fixture' && inputs.mode != 'export'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m radar alert --out alert.md
+          if [ -f alert.md ]; then
+            gh label create alert --color D93F0B --description "레이더 자동 알림" 2>/dev/null || true
+            gh issue create --title "💥 새 터짐 알림 $(date +%F)" --body-file alert.md --label alert
+          fi
+          # 알림 기록을 data 브랜치에도 반영 (다음 날 중복 방지)
+          if [ -f data/alerts_state.json ]; then
+            tmp=$(mktemp -d); cd "$tmp"
+            git clone -q --depth 1 --branch data "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" .
+            cp "$GITHUB_WORKSPACE/data/alerts_state.json" .
+            git config user.name "ccs-bot"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A; git commit -qm "alerts state" || true; git push -q origin data || true
+          fi
+
+      - name: 생산 패키지 brief 자동 생성 + 주간 브리핑(월요일)
+        if: inputs.mode != 'fixture'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          python -m radar package --date "$(date +%F)"
+          if [ -n "$GEMINI_API_KEY$GCP_SA_KEY" ]; then python -m radar autopackage --max 3 || true; fi
+          python -m radar proposals || true    # 🏛 Cue 된 입찰 → 제안서 초안   # 패키지 없는 큐 항목 자동 생성
+          if [ -n "$(git status --porcelain exports/)" ]; then
+            git config user.name "ccs-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add exports/ && git commit -qm "package: briefs $(date +%F)"
+            for i in 1 2 3; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 5; done
+            python -m radar export --date "$(date +%F)" > /dev/null   # 📦 패키지 보드 갱신
+          fi
+          if [ "$(date +%u)" = "1" ] && [ "${{ inputs.mode }}" != "export" ]; then
+            python -m radar weekly --out weekly.md
+            gh label create weekly --color 1D76DB --description "주간 시장 브리핑" 2>/dev/null || true
+            gh issue create --title "📊 주간 시장 브리핑 $(date +%F)" --body-file weekly.md --label weekly
+          fi
+
+      - name: 웹 빌드
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: web/dist }
+
+  deploy:
+    needs: collect
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4
+      - name: 배포 확인 (실제 주소 접속)
+        env:
+          URL: ${{ steps.d.outputs.page_url }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o page.html -w '%{http_code}' "$URL")
+            [ "$code" = "200" ] && curl -sf "${URL}data/summary.json" -o s.json && break
+            sleep 10
+          done
+          echo "페이지 HTTP $code"
+          python3 -c "import json;s=json.load(open('s.json'));print('데이터 갱신', s['generated_at'], '모드', s['mode'], s['counts'])"
+          curl -sf "${URL}data/queue.json" | python3 -c "import json,sys;q=json.load(sys.stdin);[print('후보', c['sc']['total'], c['ct'], '|', c['t'][:40]) for c in q['top3']]"

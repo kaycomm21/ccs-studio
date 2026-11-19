@@ -1,0 +1,100 @@
+name: verdict
+# 웹의 [생산 큐로/보류/폐기/수집 제외] 버튼 → 미리 채운 Issue → exports/ 에 기록 → 화면 재생성
+# 버튼을 연달아 눌러 실행이 취소되더라도, 매 실행이 '아직 기록 안 된 판정 Issue 전부'를 따라잡는다.
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: verdict
+  cancel-in-progress: false
+
+env:
+  MY_PROJECTS_YAML: ${{ secrets.MY_PROJECTS_YAML }}   # 입찰 실적표 (공개 저장소라 Secret)
+
+jobs:
+  record:
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.user.login == github.repository_owner && contains(github.event.issue.body, 'radar-verdict'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -q google-auth requests "anthropic[vertex]>=1.7,<2"
+      - name: 미기록 판정 Issue 전부 기록
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          TZ: Asia/Seoul
+        run: |
+          git config user.name "ccs-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh label create production-queue --color 0E8A16 --description "생산 큐 (Phase 2 생산 패키지 입력)" 2>/dev/null || true
+          gh issue list --state open --author "$OWNER" --search "radar-verdict in:body" --limit 100 --json number,title,body > issues.json
+          python - <<'PY'
+          import json, os, re, subprocess
+          issues = sorted(json.load(open("issues.json")), key=lambda i: i["number"])
+          try:
+              verdicts = json.load(open("exports/verdicts.json"))
+          except FileNotFoundError:
+              verdicts = {}
+          done = []
+          for it in issues:
+              m = re.search(r"```json\s*(\{.*?\})\s*```", it["body"], re.S)
+              if "radar-verdict" not in it["body"] or not m:
+                  continue
+              d = json.loads(m.group(1))
+              if verdicts.get(str(d.get("id")), {}).get("action") == d.get("action"):
+                  continue      # 이미 같은 판정으로 기록됨 (중복 Issue 포함) → 건너뜀
+              env = {**os.environ, "ISSUE_BODY": it["body"]}
+              r = subprocess.run(["python", "-m", "radar", "verdict-from-issue", "--number", str(it["number"])], env=env)
+              if r.returncode == 0:
+                  done.append(it)
+          json.dump(done, open("done.json", "w"), ensure_ascii=False)
+          print("기록", [i["number"] for i in done])
+          PY
+          git add exports/
+          if git commit -qm "verdict: $(python -c "import json;print(' '.join('#%d'%i['number'] for i in json.load(open('done.json'))))")"; then
+            for i in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 5; done
+          fi
+          python - <<'PY'
+          import json, subprocess
+          for it in json.load(open("done.json")):
+              n = str(it["number"])
+              if it["title"].startswith("[생산큐]"):
+                  subprocess.run(["gh", "issue", "edit", n, "--add-label", "production-queue"])
+                  subprocess.run(["gh", "issue", "comment", n, "--body", "✅ 생산 큐에 기록했습니다 (exports/production_queue.json). 생산이 끝나면 이 Issue를 닫으세요."])
+              else:
+                  subprocess.run(["gh", "issue", "close", n, "--comment", "✅ 판정을 기록했습니다 (exports/verdicts.json)."])
+          PY
+          echo "DONE=$(cat done.json | tr -d '\n')" >> "$GITHUB_ENV"
+      - name: 🎬 Cue → 생산 패키지 자동 생성 (Gemini 키가 있을 때)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          TZ: Asia/Seoul
+        run: |
+          if [ -z "$GEMINI_API_KEY$GCP_SA_KEY" ]; then echo "키 없음 — 자동 패키지 건너뜀"; else
+            mkdir -p data && (git fetch -q --depth=1 origin data && git show origin/data:radar.db.gz | gunzip > data/radar.db) || true
+            RADAR_DB=data/radar.db python -m radar autopackage --max 5 | tee pkg.txt
+            if [ -n "$(git status --porcelain exports/packages)" ]; then
+              git add exports/packages && git commit -qm "autopackage: $(grep -c '^OUT=' pkg.txt) packages"
+              for i in 1 2 3; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 3; done
+              for n in $(python -c "import json,os;print(' '.join(str(i['number']) for i in json.loads(os.environ.get('DONE','[]') or '[]') if i['title'].startswith('[생산큐]')))"); do
+                gh issue comment "$n" --body "📦 생산 패키지 자동 생성 완료 → CCS 사이트 '📦 생산 패키지' 메뉴 또는 https://github.com/${{ github.repository }}/tree/main/exports/packages (대본·제목·콘티·메타·쇼츠·팩트체크)" || true
+              done
+            fi
+          fi
+          mkdir -p data && (git fetch -q --depth=1 origin data && git show origin/data:bids_state.json > data/bids_state.json) 2>/dev/null || true
+          RADAR_DB=data/radar.db python -m radar proposals | tee prop.txt || true
+          if [ -n "$(git status --porcelain exports/proposals)" ]; then
+            git add exports/proposals && git commit -qm "proposals" && (for i in 1 2 3; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 3; done)
+          fi
+          gh workflow run daily.yml -f mode=export || true
